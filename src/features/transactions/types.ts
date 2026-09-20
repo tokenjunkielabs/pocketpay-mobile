@@ -18,6 +18,7 @@ export interface TransactionDetail {
   memo_type?: string;
   transaction_successful?: boolean;
   is_pending?: boolean;
+  status?: 'pending' | 'confirmed' | 'failed';
   type?: string;
   paging_token?: string;
   is_vault?: boolean;

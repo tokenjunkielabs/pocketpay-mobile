@@ -12,6 +12,7 @@ import { formatAmount } from '../../src/utils/amount';
 import { validateTransactionId } from '../../src/utils/validation';
 import { getExplorerTxUrl, fetchOperationById } from '../../src/services/stellar';
 import type { TransactionDetail } from '../../src/features/transactions/types';
+import { fetchTransactionStatusByHash, refreshTransactionStatus } from '../../src/features/transactions/status-refresh';
 
 type DeepLinkLoadState = 'idle' | 'loading' | 'loaded' | 'not_found' | 'error' | 'invalid';
 
@@ -26,6 +27,8 @@ export default function TransactionDetailScreen() {
   const [deepLinkState, setDeepLinkState] = useState<DeepLinkLoadState>('idle');
   const [fetchedTx, setFetchedTx] = useState<TransactionDetail | null>(null);
   const [retryCount, setRetryCount] = useState(0);
+  const [statusRefreshState, setStatusRefreshState] = useState<'idle' | 'loading' | 'unknown' | 'error'>('idle');
+  const [statusRefreshMessage, setStatusRefreshMessage] = useState<string | null>(null);
 
   // Validate the ID param
   const validationError = validateTransactionId(id);
@@ -57,14 +60,34 @@ export default function TransactionDetailScreen() {
     const fetchFromNetwork = async () => {
       setDeepLinkState('loading');
       try {
-        const record = await fetchOperationById(id!);
-        if (cancelled) return;
+        const isTransactionHash = /^[a-fA-F0-9]{64}$/.test(id!);
+        if (isTransactionHash) {
+          const statusResult = await fetchTransactionStatusByHash(id!);
+          if (cancelled) return;
 
-        if (record) {
-          setFetchedTx(record as unknown as TransactionDetail);
-          setDeepLinkState('loaded');
+          if (statusResult.status === 'unknown') {
+            setDeepLinkState('not_found');
+          } else {
+            setFetchedTx({
+              id: id!,
+              hash: id!,
+              created_at: statusResult.transaction.created_at,
+              transaction_successful: statusResult.status === 'confirmed',
+              is_pending: false,
+              status: statusResult.status,
+            });
+            setDeepLinkState('loaded');
+          }
         } else {
-          setDeepLinkState('not_found');
+          const record = await fetchOperationById(id!);
+          if (cancelled) return;
+
+          if (record) {
+            setFetchedTx(record as unknown as TransactionDetail);
+            setDeepLinkState('loaded');
+          } else {
+            setDeepLinkState('not_found');
+          }
         }
       } catch (err: any) {
         if (cancelled) return;
@@ -177,10 +200,14 @@ export default function TransactionDetailScreen() {
   const memoText = tx.memo || '';
   const memoType = tx.memo_type || '';
 
-  // Status determination
-  const isPending = tx.is_pending === true;
-  const isFailed = tx.transaction_successful === false;
-  const isSuccessful = !isPending && !isFailed;
+  // Status determination. Optimistic records use `status`; Horizon-backed
+  // records expose `transaction_successful`. If neither exists, the status
+  // is unknown and can be refreshed by transaction hash.
+  const isPending = tx.status === 'pending' || tx.is_pending === true;
+  const isFailed = tx.status === 'failed' || tx.transaction_successful === false;
+  const isSuccessful = tx.status === 'confirmed' || tx.transaction_successful === true;
+  const isUnknown = !isPending && !isFailed && !isSuccessful;
+  const canRefreshStatus = Boolean(txHash && (isPending || isUnknown));
 
   const senderLabel = resolveAddressLabel(senderAddress, contacts);
   const recipientLabel = resolveAddressLabel(recipientAddress, contacts);
@@ -211,6 +238,42 @@ export default function TransactionDetailScreen() {
     }
   };
 
+  const handleStatusRefresh = async () => {
+    if (!txHash || statusRefreshState === 'loading') return;
+
+    setStatusRefreshState('loading');
+    setStatusRefreshMessage(null);
+
+    try {
+      const result = await refreshTransactionStatus(txHash);
+
+      if (result.status === 'unknown') {
+        setStatusRefreshState('unknown');
+        setStatusRefreshMessage('Still pending or not yet available from Horizon. You can try again.');
+        return;
+      }
+
+      const confirmed = result.status === 'confirmed';
+      setFetchedTx((current) => {
+        if (!current) return current;
+        const currentHash = current.hash || current.transaction_hash || current.id;
+        if (currentHash !== txHash) return current;
+        return {
+          ...current,
+          status: result.status,
+          is_pending: false,
+          transaction_successful: confirmed,
+        };
+      });
+      setStatusRefreshState('idle');
+      setStatusRefreshMessage(confirmed ? 'Transaction confirmed.' : 'Transaction failed.');
+    } catch (error) {
+      console.error('Transaction status refresh failed:', error);
+      setStatusRefreshState('error');
+      setStatusRefreshMessage('Unable to refresh status right now. Your existing transaction state was not changed.');
+    }
+  };
+
   const getStatusConfig = () => {
     if (isPending) {
       return {
@@ -226,6 +289,14 @@ export default function TransactionDetailScreen() {
         label: 'Failed',
         color: COLORS.error,
         bgColor: 'rgba(255, 61, 0, 0.1)',
+      };
+    }
+    if (isUnknown) {
+      return {
+        icon: <RefreshCw color={COLORS.textSecondary} size={18} />,
+        label: 'Unknown',
+        color: COLORS.textSecondary,
+        bgColor: 'rgba(255, 255, 255, 0.05)',
       };
     }
     return {
@@ -298,6 +369,40 @@ export default function TransactionDetailScreen() {
             </Text>
           </View>
         </View>
+
+        {canRefreshStatus ? (
+          <View style={styles.detailRow}>
+            <TouchableOpacity
+              style={styles.refreshStatusButton}
+              onPress={handleStatusRefresh}
+              disabled={statusRefreshState === 'loading'}
+              testID="refresh-transaction-status"
+            >
+              {statusRefreshState === 'loading' ? (
+                <ActivityIndicator color={COLORS.primary} size="small" />
+              ) : (
+                <RefreshCw color={COLORS.primary} size={18} />
+              )}
+              <Text style={styles.refreshStatusButtonText}>
+                {statusRefreshState === 'loading' ? 'Refreshing status…' : 'Refresh transaction status'}
+              </Text>
+            </TouchableOpacity>
+            {statusRefreshMessage ? (
+              <Text
+                style={[
+                  styles.statusRefreshMessage,
+                  statusRefreshState === 'error' ? { color: COLORS.error } : null,
+                ]}
+              >
+                {statusRefreshMessage}
+              </Text>
+            ) : null}
+          </View>
+        ) : statusRefreshMessage ? (
+          <View style={styles.detailRow}>
+            <Text style={styles.statusRefreshMessage}>{statusRefreshMessage}</Text>
+          </View>
+        ) : null}
 
         {/* Memo */}
         {memoText ? (
@@ -560,6 +665,29 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     marginTop: SIZES.xs,
+  },
+  refreshStatusButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SIZES.sm,
+    paddingVertical: SIZES.sm,
+    paddingHorizontal: SIZES.md,
+    borderRadius: RADIUS.md,
+    borderWidth: 1,
+    borderColor: COLORS.primary,
+    backgroundColor: 'rgba(0, 229, 255, 0.08)',
+  },
+  refreshStatusButtonText: {
+    color: COLORS.primary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  statusRefreshMessage: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: SIZES.sm,
   },
   memoText: {
     color: COLORS.textPrimary,
